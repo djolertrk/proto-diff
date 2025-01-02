@@ -53,8 +53,20 @@ $ cd ${lkm_dir}
 $ bear make
 ```
 
-Test against newer linux. Lets download the source;
+Test against newer linux. Lets download the source:
 
 ```
+$ sudo apt-get install flex
+$ sudo apt-get install bison
+$ sudo apt-get install libelf-dev
 $ wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.8.tar.xz
+$ tar -xJf linux-6.8.tar.xz 
+$ cd linux-6.8/
+$ make defconfig
+$ make modules_prepare
+```
+
+Run from LKM dir:
+```
+$ ../build_proto_diff/bin/proto-diff -p=. -symbols-file=input_symbols.txt -target-linux-source=/path/to/linux-6.8/ /path/to/src/fs.c
 ```
