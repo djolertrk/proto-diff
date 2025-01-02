@@ -2,28 +2,18 @@
 //
 // Author: Djordje Todorovic
 //
-// This tool demonstrates:
-//   1) Collecting the function prototypes from the "current" LKM environment
-//      by parsing all files in compile_commands.json.
-//   2) Collecting the #includes used by a specific LKM source (e.g. sys.c)
-//      via PPCallbacks, so Clang tells us which headers are actually included.
-//   3) Mapping those old-environment header paths to the "target"
-//   kernel-headers
-//      directory, then parsing them *as standalone TUs* to gather function
-//      decls.
-//   4) Comparing the two sets of function prototypes.
+// This tool demonstrates a multi-step approach:
+//   1) Collect function prototypes from the "current" LKM environment
+//      (all sources in compile_commands.json).
+//   2) Collect the actual #includes used by an LKM source file (positional
+//   arg). 3) Find the original compile command for that LKM source file,
+//      transform the "-I" referencing the old kernel to your
+//      target linux-headers path.
+//   4) Parse the discovered headers in the "target" kernel, preserving
+//      the macros/flags from the LKM environment.
+//   5) Compare the function prototypes.
 //
-// The key differences for Clang 18 are:
-//   - We override `InclusionDirective(...)` instead of `FileIncluded(...)`.
-//   - `BeginSourceFileAction(...)` must return `bool`, not `void`.
-//   - `File` in `InclusionDirective` is `OptionalFileEntryRef`; we check
-//   `File.has_value()`.
-//
-// USAGE (example):
-//   cd /path/to/LKM/build    (has compile_commands.json)
-//   ./proto-diff -p=. \
-//       --symbols-file=input_symbols.txt \
-//       --target-linux-source=/usr/src/linux-headers-6.8.0-foo
+// Requires Clang 18 or newer (overrides InclusionDirective(...), etc.).
 
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/RecursiveASTVisitor.h"
@@ -58,7 +48,8 @@ namespace {
 llvm::cl::OptionCategory ToolCategory("proto-diff options");
 
 llvm::cl::opt<std::string>
-    SymbolsFile("symbols-file", llvm::cl::desc("Path to input_symbols.txt"),
+    SymbolsFile("symbols-file",
+                llvm::cl::desc("Path to input_symbols.txt for function names"),
                 llvm::cl::value_desc("filename"), llvm::cl::cat(ToolCategory));
 
 llvm::cl::opt<std::string>
@@ -68,21 +59,11 @@ llvm::cl::opt<std::string>
                       llvm::cl::value_desc("path"),
                       llvm::cl::cat(ToolCategory));
 
-// Which .c file to gather #includes from:
-llvm::cl::opt<std::string> LKMFileToAnalyze(
-    "lkm-file",
-    llvm::cl::desc(
-        "Which .c file in compile_commands.json to gather includes from"),
-    llvm::cl::value_desc("file"),
-    llvm::cl::init("src/sys.c"), // example default
-    llvm::cl::cat(ToolCategory));
-
 // If you want to parse the target headers as C or C++:
 llvm::cl::opt<std::string> TargetLanguage(
     "target-lang",
     llvm::cl::desc("Language for parsing target headers (c, c-header, c++...)"),
-    llvm::cl::init("c"), // default to C
-    llvm::cl::cat(ToolCategory));
+    llvm::cl::init("c"), llvm::cl::cat(ToolCategory));
 } // end anonymous namespace
 
 //---------------------------------------------------------------------------//
@@ -109,7 +90,7 @@ public:
         SymbolsToCheck(SymbolsToCheck) {}
 
   bool VisitFunctionDecl(clang::FunctionDecl *FD) {
-    // If we have symbols to check, skip anything not in that list
+    // If we have a list of symbols, skip anything not in that list
     if (!SymbolsToCheck.empty()) {
       std::string Name = FD->getNameAsString();
       auto It = std::find(SymbolsToCheck.begin(), SymbolsToCheck.end(), Name);
@@ -117,7 +98,6 @@ public:
         return true; // skip
       }
     }
-
     // Collect function info
     FunctionInfo Info;
     Info.Name = FD->getNameAsString();
@@ -184,8 +164,7 @@ private:
 };
 
 //---------------------------------------------------------------------------//
-// 4) PPCallbacks-based approach to gather #includes
-//    Note: for Clang 18, we override InclusionDirective, not FileIncluded.
+// 4) PPCallbacks-based approach to gather #includes (Clang 18+)
 //---------------------------------------------------------------------------//
 
 class IncludeCollector : public clang::PPCallbacks {
@@ -193,7 +172,7 @@ public:
   IncludeCollector(clang::SourceManager &SM, std::set<std::string> &Collected)
       : SM(SM), Collected(Collected) {}
 
-  // Clang 18+ signature for includes:
+  // For Clang 18+: InclusionDirective is the correct override
   void InclusionDirective(clang::SourceLocation HashLoc,
                           const clang::Token &IncludeTok,
                           llvm::StringRef FileName, bool IsAngled,
@@ -205,9 +184,7 @@ public:
                           clang::SrcMgr::CharacteristicKind FileType) override {
     if (!File.has_value())
       return;
-    // Get the actual FileEntry
     auto &FE = File->getFileEntry();
-    // Insert the absolute path into the set
     Collected.insert(FE.getName().str());
   }
 
@@ -224,15 +201,15 @@ public:
   std::unique_ptr<clang::ASTConsumer>
   CreateASTConsumer(clang::CompilerInstance &CI,
                     clang::StringRef InFile) override {
+    // We don't traverse AST, so return empty consumer
     return std::make_unique<clang::ASTConsumer>();
   }
 
-  // Must return bool in Clang 18+ (was void in older versions)
   bool BeginSourceFileAction(clang::CompilerInstance &CI) override {
     clang::Preprocessor &PP = CI.getPreprocessor();
     PP.addPPCallbacks(
         std::make_unique<IncludeCollector>(CI.getSourceManager(), Collected));
-    return true; // indicate success
+    return true; // success
   }
 
 private:
@@ -305,7 +282,7 @@ static void CompareFunctions(const std::vector<FunctionInfo> &File1Functions,
 }
 
 //---------------------------------------------------------------------------//
-// 6) Helper: run a ClangTool with a given CompilationDatabase & sources
+// 6) Helper: run ClangTool with a given CompilationDatabase & sources
 //---------------------------------------------------------------------------//
 
 static bool RunToolWithDB(clang::tooling::CompilationDatabase &CompDB,
@@ -315,32 +292,77 @@ static bool RunToolWithDB(clang::tooling::CompilationDatabase &CompDB,
   clang::tooling::ClangTool Tool(CompDB, Sources);
   auto Factory =
       std::make_unique<FunctionDeclActionFactory>(OutFunctions, SymbolsToCheck);
-  return (Tool.run(Factory.get()) != 0); // returns true on error
+  // returns true on error
+  return (Tool.run(Factory.get()) != 0);
 }
 
 //---------------------------------------------------------------------------//
-// 7) Example: Map old header path => new header path
+// 7) Retrieve and transform the compile command
+//---------------------------------------------------------------------------//
+
+// Retrieve original compile command for a specific .c file
+static std::vector<std::string>
+getCompileCommandFor(clang::tooling::CompilationDatabase &DB,
+                     const std::string &FilePath) {
+  auto Commands = DB.getCompileCommands(FilePath);
+  if (Commands.empty()) {
+    return {};
+  }
+  return Commands.front().CommandLine;
+}
+
+// Transform -I/usr/src/... => -I/target if needed
+static std::vector<std::string>
+transformCompileCommand(const std::vector<std::string> &OriginalArgs,
+                        llvm::StringRef OldBase, llvm::StringRef NewBase) {
+  std::vector<std::string> NewArgs;
+  NewArgs.reserve(OriginalArgs.size());
+
+  for (auto &Arg : OriginalArgs) {
+    // skip the .c file
+    llvm::StringRef ArgAsStringRef(Arg);
+    if (ArgAsStringRef.endswith(".c") || ArgAsStringRef.endswith(".cc") ||
+        ArgAsStringRef.endswith(".cpp")) {
+      continue;
+    }
+    // if Arg is -I/usr/src/old => rewrite
+    if (ArgAsStringRef.startswith("-I")) {
+      llvm::StringRef Path = Arg.substr(2);
+      if (Path.startswith(OldBase)) {
+        std::string subpath = Path.substr(OldBase.size()).str();
+        std::string Repl = (NewBase + subpath).str();
+        NewArgs.push_back("-I" + Repl);
+        continue;
+      }
+    }
+    // keep everything else
+    NewArgs.push_back(Arg);
+  }
+
+  return NewArgs;
+}
+
+//---------------------------------------------------------------------------//
+// 8) Map old absolute header path => new absolute header path
 //---------------------------------------------------------------------------//
 
 static std::string mapOldToNew(const std::string &OldPath,
                                const std::string &OldBase,
                                const std::string &NewBase) {
-  // If OldPath starts with OldBase, replace that portion.
-  // This is naive; real logic may be more complicated.
   if (OldPath.find(OldBase) == 0) {
     std::string subpath = OldPath.substr(OldBase.size());
     return NewBase + subpath;
   }
-  // fallback: just re-root in NewBase
+  // fallback
   return NewBase + OldPath;
 }
 
 //---------------------------------------------------------------------------//
-// 8) Main
+// 9) Main
 //---------------------------------------------------------------------------//
 
 int main(int argc, const char **argv) {
-  // Parse the "current" environment from the LKM build dir
+  // 0) Parse the "current" environment from the LKM build dir
   auto ExpectedParser =
       clang::tooling::CommonOptionsParser::create(argc, argv, ToolCategory);
   if (!ExpectedParser) {
@@ -351,12 +373,23 @@ int main(int argc, const char **argv) {
   }
   clang::tooling::CommonOptionsParser &CurrentKernelOptions = *ExpectedParser;
 
-  // We require -target-linux-source
+  // Must specify -target-linux-source
   if (TargetLinuxSource.empty()) {
     llvm::WithColor::error()
         << "No -target-linux-source specified. This argument is required.\n";
     return 1;
   }
+
+  // The LKM file is taken as a positional argument from the SourcePathList,
+  // after the normal CommonOptionsParser arguments. We expect exactly one:
+  auto PositionalArgs = CurrentKernelOptions.getSourcePathList();
+  if (PositionalArgs.empty()) {
+    llvm::WithColor::error()
+        << "No LKM source file specified as a positional argument.\n";
+    return 1;
+  }
+  // We'll just take the first one as "LKMFileToAnalyze"
+  std::string LKMFileToAnalyze = PositionalArgs.front();
 
   // Read symbols from input_symbols.txt if provided
   std::vector<std::string> SymbolsToCheck;
@@ -370,8 +403,7 @@ int main(int argc, const char **argv) {
     }
   }
 
-  // 1) Gather function prototypes from the "current" LKM build environment
-  //    by parsing *all* files in compile_commands.json, or pick what you want.
+  // 1) Gather function prototypes from the "current" environment
   std::vector<FunctionInfo> OldFunctions;
   {
     auto &DB = CurrentKernelOptions.getCompilations();
@@ -380,20 +412,20 @@ int main(int argc, const char **argv) {
       llvm::WithColor::warning()
           << "No files found in the current compile_commands.json.\n";
     }
-
     if (RunToolWithDB(DB, AllFiles, SymbolsToCheck, OldFunctions)) {
-      llvm::WithColor::error() << "Error processing current (LKM) environment "
-                                  "function prototypes.\n";
+      llvm::WithColor::error()
+          << "Error processing current environment prototypes.\n";
       return 1;
     }
   }
 
-  // 2) Collect includes from the file we want to analyze (e.g. "src/sys.c")
+  // 2) Collect includes from the LKMFileToAnalyze
   std::set<std::string> UsedHeaders;
   {
     auto &DB = CurrentKernelOptions.getCompilations();
 
-    // Find the .c file in DB
+    // Ensure we can find a compile command for LKMFileToAnalyze
+    // (some DBs use absolute vs. relative paths)
     std::string FullCPath;
     {
       auto FilesInDB = DB.getAllFiles();
@@ -406,7 +438,7 @@ int main(int argc, const char **argv) {
       if (FullCPath.empty() && !FilesInDB.empty()) {
         llvm::WithColor::warning()
             << "Cannot find " << LKMFileToAnalyze
-            << " in compile_commands.json. Will pick first file.\n";
+            << " in compile_commands.json. Using first file.\n";
         FullCPath = FilesInDB.front();
       }
     }
@@ -421,42 +453,65 @@ int main(int argc, const char **argv) {
             << "Error collecting includes from " << FullCPath << "\n";
       }
     } else {
-      llvm::WithColor::warning() << "No LKM file to analyze for includes!\n";
+      llvm::WithColor::warning() << "No file to analyze for includes!\n";
     }
   }
 
   // 3) Map those used headers to the target kernel, parse them
   std::vector<FunctionInfo> NewFunctions;
   if (!UsedHeaders.empty()) {
+    // Example: old base might be /usr/src/linux-headers-5.15.0-127-generic
     std::string OldBase = "/usr/src/linux-headers-5.15.0-127-generic";
-    // In a real scenario, detect or store old base from compile_commands.json
 
+    // 3a) We get the original compile command for LKMFileToAnalyze
+    auto &DB = CurrentKernelOptions.getCompilations();
+    std::vector<std::string> OriginalCmd =
+        getCompileCommandFor(DB, LKMFileToAnalyze);
+    if (OriginalCmd.empty()) {
+      llvm::WithColor::warning()
+          << "Could not retrieve a compile command for " << LKMFileToAnalyze
+          << ". Using a minimal approach.\n";
+    }
+
+    // 3b) Transform that command, rewriting -I references from OldBase =>
+    // TargetLinuxSource
+    std::vector<std::string> EditedArgs;
+    if (!OriginalCmd.empty()) {
+      EditedArgs =
+          transformCompileCommand(OriginalCmd, OldBase, TargetLinuxSource);
+      // Optionally adjust macros if you want to emulate a new version:
+      // EditedArgs.push_back("-DLINUX_VERSION_CODE=0x060800");
+    } else {
+      // fallback minimal approach
+      EditedArgs = {
+          "clang",
+          "-x",
+          TargetLanguage,
+          "-std=gnu89",
+          "-I" + TargetLinuxSource + "/include",
+      };
+    }
+
+    // 3c) Build a new compile DB with those edited args
+    clang::tooling::FixedCompilationDatabase TargetCDB(TargetLinuxSource,
+                                                       EditedArgs);
+
+    // 3d) For each header in UsedHeaders, map old => new
     std::vector<std::string> TargetHeaderFiles;
     TargetHeaderFiles.reserve(UsedHeaders.size());
     for (auto &H : UsedHeaders) {
       TargetHeaderFiles.push_back(mapOldToNew(H, OldBase, TargetLinuxSource));
     }
 
-    // We'll parse these .h files as standalone TUs in the target environment
-    std::vector<std::string> BaseFlags = {
-        "/usr/bin/gcc",        "-x",
-        TargetLanguage, // e.g., "c" or "c-header"
-        "-std=gnu89",   "-I" + TargetLinuxSource + "/include",
-        "-I" + TargetLinuxSource + "/arch/x86/include/",
-        "-I" + TargetLinuxSource + "/arch/x86/include/",
-        // add more -I or -D as needed
-    };
-    clang::tooling::FixedCompilationDatabase TargetCDB(TargetLinuxSource,
-                                                       BaseFlags);
-
+    // 3e) Parse them, collecting function prototypes
     if (RunToolWithDB(TargetCDB, TargetHeaderFiles, SymbolsToCheck,
                       NewFunctions)) {
       llvm::WithColor::error() << "Error processing target linux headers.\n";
       return 1;
     }
   } else {
-    llvm::WithColor::warning() << "No headers used by " << LKMFileToAnalyze
-                               << " were discovered. (Empty set)\n";
+    llvm::WithColor::warning() << "No headers discovered for "
+                               << LKMFileToAnalyze << " (empty set).\n";
   }
 
   // 4) Compare
