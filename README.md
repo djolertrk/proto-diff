@@ -43,3 +43,18 @@ Function "fn" has changed:
   Parameters: int,  -> 
 
 ```
+
+## Test it on a Linux LKM
+
+```
+$ sudo apt install bear
+$ cd ${lkm_dir}
+# create compile_commands.json
+$ bear make
+```
+
+Test against newer linux. Lets download the source;
+
+```
+$ wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.8.tar.xz
+```
