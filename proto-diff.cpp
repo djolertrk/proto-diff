@@ -35,7 +35,6 @@
 #include "clang/Tooling/CommonOptionsParser.h"
 #include "clang/Tooling/CompilationDatabase.h"
 #include "clang/Tooling/Tooling.h"
-#include "llvm/ADT/Optional.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
@@ -440,9 +439,11 @@ int main(int argc, const char **argv) {
 
     // We'll parse these .h files as standalone TUs in the target environment
     std::vector<std::string> BaseFlags = {
-        "clang",        "-x",
+        "/usr/bin/gcc",        "-x",
         TargetLanguage, // e.g., "c" or "c-header"
         "-std=gnu89",   "-I" + TargetLinuxSource + "/include",
+        "-I" + TargetLinuxSource + "/arch/x86/include/",
+        "-I" + TargetLinuxSource + "/arch/x86/include/",
         // add more -I or -D as needed
     };
     clang::tooling::FixedCompilationDatabase TargetCDB(TargetLinuxSource,
