@@ -60,10 +60,11 @@ $ sudo apt-get install flex
 $ sudo apt-get install bison
 $ sudo apt-get install libelf-dev
 $ wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.8.tar.xz
-$ tar -xJf linux-6.8.tar.xz 
+$ cp linux-6.8.tar.xz /usr/src/ && cd /usr/src/
+$ tar -xJf linux-6.8.tar.xz
 $ cd linux-6.8/
-$ make defconfig
-$ make modules_prepare
+$ sudo make defconfig
+$ sudo make modules_prepare
 ```
 
 Run from LKM dir:

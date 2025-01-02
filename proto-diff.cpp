@@ -1,74 +1,63 @@
-// A tool for source code analysis.
+// A minimal proto-diff tool, doing two passes on the SAME files:
+//  1) Read normal compile_commands.json (run #1).
+//  2) Create an in-memory compile DB with replaced "directory" and flags
+//     (run #2), on the SAME source files.
 //
-// Author: Djordje Todorovic
+// No usage of "FixedCompilationDatabase" or "CompileCommand.File" is needed.
+// We define local "startsWith" checks using manual string operations.
 //
-// This tool demonstrates a multi-step approach:
-//   1) Collect function prototypes from the "current" LKM environment
-//      (all sources in compile_commands.json).
-//   2) Collect the actual #includes used by an LKM source file (positional
-//   arg). 3) Find the original compile command for that LKM source file,
-//      transform the "-I" referencing the old kernel to your
-//      target linux-headers path.
-//   4) Parse the discovered headers in the "target" kernel, preserving
-//      the macros/flags from the LKM environment.
-//   5) Compare the function prototypes.
-//
-// Requires Clang 18 or newer (overrides InclusionDirective(...), etc.).
+// By Djordje Todorovic
 
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/RecursiveASTVisitor.h"
-#include "clang/Basic/SourceManager.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendAction.h"
 #include "clang/Lex/PPCallbacks.h"
-#include "clang/Lex/Preprocessor.h"
 #include "clang/Tooling/CommonOptionsParser.h"
 #include "clang/Tooling/CompilationDatabase.h"
 #include "clang/Tooling/Tooling.h"
 #include "llvm/Support/CommandLine.h"
-#include "llvm/Support/FileSystem.h"
-#include "llvm/Support/Path.h"
 #include "llvm/Support/WithColor.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <fstream>
-#include <iostream>
 #include <memory>
-#include <set>
 #include <string>
-#include <system_error>
 #include <vector>
 
-//---------------------------------------------------------------------------//
+// ------------------------------------------------------------------------
 // 1) Command-line options
-//---------------------------------------------------------------------------//
+// ------------------------------------------------------------------------
 
 namespace {
 llvm::cl::OptionCategory ToolCategory("proto-diff options");
 
 llvm::cl::opt<std::string>
-    SymbolsFile("symbols-file",
-                llvm::cl::desc("Path to input_symbols.txt for function names"),
+    SymbolsFile("symbols-file", llvm::cl::desc("Path to input_symbols.txt"),
                 llvm::cl::value_desc("filename"), llvm::cl::cat(ToolCategory));
 
+// You want to transform "directory" field to this:
 llvm::cl::opt<std::string>
     TargetLinuxSource("target-linux-source",
-                      llvm::cl::desc("Path to new (target) linux-headers "
-                                     "directory (no compile_commands.json)"),
+                      llvm::cl::desc("New directory path to replace the "
+                                     "original compile command's directory"),
                       llvm::cl::value_desc("path"),
                       llvm::cl::cat(ToolCategory));
-
-// If you want to parse the target headers as C or C++:
-llvm::cl::opt<std::string> TargetLanguage(
-    "target-lang",
-    llvm::cl::desc("Language for parsing target headers (c, c-header, c++...)"),
-    llvm::cl::init("c"), llvm::cl::cat(ToolCategory));
 } // end anonymous namespace
 
-//---------------------------------------------------------------------------//
-// 2) Data structures for function prototypes
-//---------------------------------------------------------------------------//
+// ------------------------------------------------------------------------
+// 2) Utility: startsWith (C++17-friendly, no std::string::starts_with)
+// ------------------------------------------------------------------------
+static bool startsWith(const std::string &Str, const std::string &Prefix) {
+  if (Prefix.size() > Str.size())
+    return false;
+  return std::equal(Prefix.begin(), Prefix.end(), Str.begin());
+}
+
+// ------------------------------------------------------------------------
+// 3) Data structures for function prototypes
+// ------------------------------------------------------------------------
 
 struct FunctionInfo {
   std::string Name;
@@ -76,33 +65,31 @@ struct FunctionInfo {
   std::vector<std::string> Parameters;
 };
 
-//---------------------------------------------------------------------------//
-// 3) AST visitor to gather function declarations
-//---------------------------------------------------------------------------//
+// ------------------------------------------------------------------------
+// 4) AST visitor to gather function declarations
+// ------------------------------------------------------------------------
 
 class FunctionDeclVisitor
     : public clang::RecursiveASTVisitor<FunctionDeclVisitor> {
 public:
-  FunctionDeclVisitor(clang::ASTContext *Ctx,
+  FunctionDeclVisitor(clang::ASTContext &Ctx,
                       std::vector<FunctionInfo> &OutFunctions,
-                      const std::vector<std::string> &SymbolsToCheck)
-      : Context(Ctx), OutFunctions(OutFunctions),
-        SymbolsToCheck(SymbolsToCheck) {}
+                      const std::vector<std::string> &Symbols)
+      : Ctx(Ctx), OutFunctions(OutFunctions), Symbols(Symbols) {}
 
   bool VisitFunctionDecl(clang::FunctionDecl *FD) {
-    // If we have a list of symbols, skip anything not in that list
-    if (!SymbolsToCheck.empty()) {
+    if (!Symbols.empty()) {
+      // If we have a list of symbols, skip others
       std::string Name = FD->getNameAsString();
-      auto It = std::find(SymbolsToCheck.begin(), SymbolsToCheck.end(), Name);
-      if (It == SymbolsToCheck.end()) {
+      if (std::find(Symbols.begin(), Symbols.end(), Name) == Symbols.end()) {
         return true; // skip
       }
     }
-    // Collect function info
+
     FunctionInfo Info;
     Info.Name = FD->getNameAsString();
     Info.ReturnType = FD->getReturnType().getAsString();
-    for (const auto *Param : FD->parameters()) {
+    for (auto *Param : FD->parameters()) {
       Info.Parameters.push_back(Param->getType().getAsString());
     }
     OutFunctions.push_back(Info);
@@ -110,17 +97,17 @@ public:
   }
 
 private:
-  clang::ASTContext *Context;
+  clang::ASTContext &Ctx;
   std::vector<FunctionInfo> &OutFunctions;
-  const std::vector<std::string> &SymbolsToCheck;
+  const std::vector<std::string> &Symbols;
 };
 
 class FunctionDeclASTConsumer : public clang::ASTConsumer {
 public:
-  FunctionDeclASTConsumer(std::vector<FunctionInfo> &OutFunctions,
-                          const std::vector<std::string> &SymbolsToCheck,
+  FunctionDeclASTConsumer(std::vector<FunctionInfo> &Out,
+                          const std::vector<std::string> &Syms,
                           clang::ASTContext &Ctx)
-      : Visitor(&Ctx, OutFunctions, SymbolsToCheck) {}
+      : Visitor(Ctx, Out, Syms) {}
 
   void HandleTranslationUnit(clang::ASTContext &Context) override {
     Visitor.TraverseDecl(Context.getTranslationUnitDecl());
@@ -132,389 +119,257 @@ private:
 
 class FunctionDeclAction : public clang::ASTFrontendAction {
 public:
-  FunctionDeclAction(std::vector<FunctionInfo> &OutFunctions,
-                     const std::vector<std::string> &SymbolsToCheck)
-      : OutFunctions(OutFunctions), SymbolsToCheck(SymbolsToCheck) {}
+  FunctionDeclAction(std::vector<FunctionInfo> &Out,
+                     const std::vector<std::string> &Syms)
+      : OutFunctions(Out), Symbols(Syms) {}
 
   std::unique_ptr<clang::ASTConsumer>
   CreateASTConsumer(clang::CompilerInstance &CI,
-                    clang::StringRef InFile) override {
-    return std::make_unique<FunctionDeclASTConsumer>(
-        OutFunctions, SymbolsToCheck, CI.getASTContext());
+                    clang::StringRef /*InFile*/) override {
+    return std::make_unique<FunctionDeclASTConsumer>(OutFunctions, Symbols,
+                                                     CI.getASTContext());
   }
 
 private:
   std::vector<FunctionInfo> &OutFunctions;
-  const std::vector<std::string> &SymbolsToCheck;
+  const std::vector<std::string> &Symbols;
 };
 
+// A small factory
 class FunctionDeclActionFactory : public clang::tooling::FrontendActionFactory {
 public:
-  FunctionDeclActionFactory(std::vector<FunctionInfo> &OutFunctions,
-                            const std::vector<std::string> &SymbolsToCheck)
-      : OutFunctions(OutFunctions), SymbolsToCheck(SymbolsToCheck) {}
+  FunctionDeclActionFactory(std::vector<FunctionInfo> &Out,
+                            const std::vector<std::string> &Syms)
+      : OutFunctions(Out), Symbols(Syms) {}
 
   std::unique_ptr<clang::FrontendAction> create() override {
-    return std::make_unique<FunctionDeclAction>(OutFunctions, SymbolsToCheck);
+    return std::make_unique<FunctionDeclAction>(OutFunctions, Symbols);
   }
 
 private:
   std::vector<FunctionInfo> &OutFunctions;
-  const std::vector<std::string> &SymbolsToCheck;
+  const std::vector<std::string> &Symbols;
 };
 
-//---------------------------------------------------------------------------//
-// 4) PPCallbacks-based approach to gather #includes (Clang 18+)
-//---------------------------------------------------------------------------//
-
-class IncludeCollector : public clang::PPCallbacks {
-public:
-  IncludeCollector(clang::SourceManager &SM, std::set<std::string> &Collected)
-      : SM(SM), Collected(Collected) {}
-
-  // For Clang 18+: InclusionDirective is the correct override
-  void InclusionDirective(clang::SourceLocation HashLoc,
-                          const clang::Token &IncludeTok,
-                          llvm::StringRef FileName, bool IsAngled,
-                          clang::CharSourceRange FilenameRange,
-                          clang::OptionalFileEntryRef File,
-                          llvm::StringRef SearchPath,
-                          llvm::StringRef RelativePath,
-                          const clang::Module *Imported,
-                          clang::SrcMgr::CharacteristicKind FileType) override {
-    if (!File.has_value())
-      return;
-    auto &FE = File->getFileEntry();
-    Collected.insert(FE.getName().str());
-  }
-
-private:
-  clang::SourceManager &SM;
-  std::set<std::string> &Collected;
-};
-
-class CollectIncludesAction : public clang::ASTFrontendAction {
-public:
-  CollectIncludesAction(std::set<std::string> &Collected)
-      : Collected(Collected) {}
-
-  std::unique_ptr<clang::ASTConsumer>
-  CreateASTConsumer(clang::CompilerInstance &CI,
-                    clang::StringRef InFile) override {
-    // We don't traverse AST, so return empty consumer
-    return std::make_unique<clang::ASTConsumer>();
-  }
-
-  bool BeginSourceFileAction(clang::CompilerInstance &CI) override {
-    clang::Preprocessor &PP = CI.getPreprocessor();
-    PP.addPPCallbacks(
-        std::make_unique<IncludeCollector>(CI.getSourceManager(), Collected));
-    return true; // success
-  }
-
-private:
-  std::set<std::string> &Collected;
-};
-
-class CollectIncludesActionFactory
-    : public clang::tooling::FrontendActionFactory {
-public:
-  CollectIncludesActionFactory(std::set<std::string> &Collected)
-      : Collected(Collected) {}
-
-  std::unique_ptr<clang::FrontendAction> create() override {
-    return std::make_unique<CollectIncludesAction>(Collected);
-  }
-
-private:
-  std::set<std::string> &Collected;
-};
-
-//---------------------------------------------------------------------------//
-// 5) CompareFunctions
-//---------------------------------------------------------------------------//
-
-static void CompareFunctions(const std::vector<FunctionInfo> &File1Functions,
-                             const std::vector<FunctionInfo> &File2Functions) {
+// ------------------------------------------------------------------------
+// 5) Compare function prototypes
+// ------------------------------------------------------------------------
+static void compareFunctions(const std::vector<FunctionInfo> &OldF,
+                             const std::vector<FunctionInfo> &NewF) {
   llvm::outs() << "=== Differences in Function Declarations ===\n";
 
-  // Check for changed or removed
-  for (const auto &Func1 : File1Functions) {
-    auto It = std::find_if(
-        File2Functions.begin(), File2Functions.end(),
-        [&](const FunctionInfo &F2) { return Func1.Name == F2.Name; });
-    if (It != File2Functions.end()) {
-      const auto &Func2 = *It;
-      if (Func1.Parameters != Func2.Parameters ||
-          Func1.ReturnType != Func2.ReturnType) {
+  // check changed or removed
+  for (auto &OF : OldF) {
+    auto It = std::find_if(NewF.begin(), NewF.end(),
+                           [&](auto &NF) { return NF.Name == OF.Name; });
+    if (It != NewF.end()) {
+      // check changes
+      if (OF.ReturnType != It->ReturnType || OF.Parameters != It->Parameters) {
         llvm::WithColor(llvm::outs(), llvm::HighlightColor::String)
-            << "Function \"" << Func1.Name << "\" has changed:\n";
-        llvm::WithColor(llvm::outs(), llvm::HighlightColor::String)
-            << "  Return type: " << Func1.ReturnType << " -> "
-            << Func2.ReturnType << "\n";
-        llvm::WithColor(llvm::outs(), llvm::HighlightColor::String)
-            << "  Parameters: ";
-        for (auto &P : Func1.Parameters)
-          llvm::WithColor(llvm::outs(), llvm::HighlightColor::String)
-              << P << ", ";
-        llvm::WithColor(llvm::outs(), llvm::HighlightColor::String) << " -> ";
-        for (auto &P : Func2.Parameters)
-          llvm::WithColor(llvm::outs(), llvm::HighlightColor::String)
-              << P << ", ";
-        llvm::WithColor(llvm::outs(), llvm::HighlightColor::String) << "\n";
+            << "Function \"" << OF.Name << "\" has changed:\n";
+        llvm::outs() << "  Return type: " << OF.ReturnType << " -> "
+                     << It->ReturnType << "\n";
+        llvm::outs() << "  Parameters: ";
+        for (auto &P : OF.Parameters)
+          llvm::outs() << P << ", ";
+        llvm::outs() << " -> ";
+        for (auto &P : It->Parameters)
+          llvm::outs() << P << ", ";
+        llvm::outs() << "\n";
       }
     } else {
       llvm::WithColor(llvm::outs(), llvm::HighlightColor::String)
-          << "Function \"" << Func1.Name << "\" removed.\n";
+          << "Function \"" << OF.Name << "\" removed.\n";
     }
   }
-
-  // Check for newly added
-  for (const auto &Func2 : File2Functions) {
-    auto It = std::find_if(
-        File1Functions.begin(), File1Functions.end(),
-        [&](const FunctionInfo &F1) { return Func2.Name == F1.Name; });
-    if (It == File1Functions.end()) {
+  // check newly added
+  for (auto &NF : NewF) {
+    auto It = std::find_if(OldF.begin(), OldF.end(),
+                           [&](auto &OF) { return OF.Name == NF.Name; });
+    if (It == OldF.end()) {
       llvm::WithColor(llvm::outs(), llvm::HighlightColor::String)
-          << "Function \"" << Func2.Name << "\" added.\n";
+          << "Function \"" << NF.Name << "\" added.\n";
     }
   }
 }
 
-//---------------------------------------------------------------------------//
-// 6) Helper: run ClangTool with a given CompilationDatabase & sources
-//---------------------------------------------------------------------------//
-
-static bool RunToolWithDB(clang::tooling::CompilationDatabase &CompDB,
-                          const std::vector<std::string> &Sources,
-                          const std::vector<std::string> &SymbolsToCheck,
-                          std::vector<FunctionInfo> &OutFunctions) {
-  clang::tooling::ClangTool Tool(CompDB, Sources);
-  auto Factory =
-      std::make_unique<FunctionDeclActionFactory>(OutFunctions, SymbolsToCheck);
-  // returns true on error
+// ------------------------------------------------------------------------
+// 6) Helper function to run the function-decl action
+// ------------------------------------------------------------------------
+static bool runFunctionAction(clang::tooling::CompilationDatabase &DB,
+                              const std::vector<std::string> &Files,
+                              const std::vector<std::string> &Symbols,
+                              std::vector<FunctionInfo> &Out) {
+  clang::tooling::ClangTool Tool(DB, Files);
+  auto Factory = std::make_unique<FunctionDeclActionFactory>(Out, Symbols);
+  // returns 0 on success
   return (Tool.run(Factory.get()) != 0);
 }
 
-//---------------------------------------------------------------------------//
-// 7) Retrieve and transform the compile command
-//---------------------------------------------------------------------------//
+// ------------------------------------------------------------------------
+// 7) Build a memory-based compile DB with updated "directory" + updated flags
+// ------------------------------------------------------------------------
+class MemoryCompileDB : public clang::tooling::CompilationDatabase {
+public:
+  // We store a single set of arguments for each file in "Files".
+  MemoryCompileDB(std::vector<std::string> Files, std::string Directory,
+                  std::vector<std::string> Args)
+      : Files(std::move(Files)), Directory(std::move(Directory)),
+        Args(std::move(Args)) {}
 
-// Retrieve original compile command for a specific .c file
-static std::vector<std::string>
-getCompileCommandFor(clang::tooling::CompilationDatabase &DB,
-                     const std::string &FilePath) {
-  auto Commands = DB.getCompileCommands(FilePath);
-  if (Commands.empty()) {
-    return {};
-  }
-  return Commands.front().CommandLine;
-}
+  // returns all files
+  std::vector<std::string> getAllFiles() const override { return Files; }
 
-// Transform -I/usr/src/... => -I/target if needed
-static std::vector<std::string>
-transformCompileCommand(const std::vector<std::string> &OriginalArgs,
-                        llvm::StringRef OldBase, llvm::StringRef NewBase) {
-  std::vector<std::string> NewArgs;
-  NewArgs.reserve(OriginalArgs.size());
-
-  for (auto &Arg : OriginalArgs) {
-    // skip the .c file
-    llvm::StringRef ArgAsStringRef(Arg);
-    if (ArgAsStringRef.endswith(".c") || ArgAsStringRef.endswith(".cc") ||
-        ArgAsStringRef.endswith(".cpp")) {
-      continue;
+  // returns compile commands for a given "FilePath"
+  std::vector<clang::tooling::CompileCommand>
+  getCompileCommands(llvm::StringRef FilePath) const override {
+    // If FilePath is in "Files", produce one command with updated
+    // directory/args
+    std::vector<clang::tooling::CompileCommand> Commands;
+    auto It = std::find(Files.begin(), Files.end(), FilePath.str());
+    if (It != Files.end()) {
+      // produce one command
+      clang::tooling::CompileCommand CC;
+      CC.Directory = Directory;
+      CC.CommandLine = Args;
+      CC.Filename =
+          FilePath.str(); // old "File" replaced by "Filename" in older Clang
+      // "Output" can remain empty
+      Commands.push_back(std::move(CC));
     }
-    // if Arg is -I/usr/src/old => rewrite
-    if (ArgAsStringRef.startswith("-I")) {
-      llvm::StringRef Path = Arg.substr(2);
-      if (Path.startswith(OldBase)) {
-        std::string subpath = Path.substr(OldBase.size()).str();
-        std::string Repl = (NewBase + subpath).str();
-        NewArgs.push_back("-I" + Repl);
-        continue;
-      }
+    return Commands;
+  }
+
+  // for completeness, "getCompileCommands()" for all files
+  std::vector<clang::tooling::CompileCommand>
+  getAllCompileCommands() const override {
+    std::vector<clang::tooling::CompileCommand> Commands;
+    for (auto &F : Files) {
+      clang::tooling::CompileCommand CC;
+      CC.Directory = Directory;
+      CC.CommandLine = Args;
+      CC.Filename = F;
+      Commands.push_back(std::move(CC));
     }
-    // keep everything else
-    NewArgs.push_back(Arg);
+    return Commands;
   }
 
-  return NewArgs;
-}
+private:
+  std::vector<std::string> Files;
+  std::string Directory;
+  std::vector<std::string> Args;
+};
 
-//---------------------------------------------------------------------------//
-// 8) Map old absolute header path => new absolute header path
-//---------------------------------------------------------------------------//
-
-static std::string mapOldToNew(const std::string &OldPath,
-                               const std::string &OldBase,
-                               const std::string &NewBase) {
-  if (OldPath.find(OldBase) == 0) {
-    std::string subpath = OldPath.substr(OldBase.size());
-    return NewBase + subpath;
+// A helper to strip or rewrite flags
+static std::vector<std::string>
+transformFlags(const std::vector<std::string> &OldFlags) {
+  std::vector<std::string> NewFlags;
+  for (auto &Flag : OldFlags) {
+    // For example, remove flags that cause clang warnings
+    // e.g. -falign-jumps=1, -Wimplicit-fallthrough=5, etc.
+    // Check "startsWith(Flag, "...")"
+    if (startsWith(Flag, "-falign-jumps=1")) {
+      continue; // skip
+    }
+    if (startsWith(Flag, "-Wimplicit-fallthrough=5")) {
+      continue; // skip
+    }
+    // ... etc. Or rewrite -I/usr/src => -I/home/djtodor...
+    // For minimal example, we just keep everything
+    NewFlags.push_back(Flag);
   }
-  // fallback
-  return NewBase + OldPath;
+  return NewFlags;
 }
 
-//---------------------------------------------------------------------------//
-// 9) Main
-//---------------------------------------------------------------------------//
+// ------------------------------------------------------------------------
+// 8) main()
+// ------------------------------------------------------------------------
 
 int main(int argc, const char **argv) {
-  // 0) Parse the "current" environment from the LKM build dir
   auto ExpectedParser =
       clang::tooling::CommonOptionsParser::create(argc, argv, ToolCategory);
   if (!ExpectedParser) {
     llvm::WithColor::error()
-        << "[Failed to parse arguments] "
+        << "Failed to parse arguments: "
         << llvm::toString(ExpectedParser.takeError()) << "\n";
     return 1;
   }
-  clang::tooling::CommonOptionsParser &CurrentKernelOptions = *ExpectedParser;
+  clang::tooling::CommonOptionsParser &Options = *ExpectedParser;
 
-  // Must specify -target-linux-source
-  if (TargetLinuxSource.empty()) {
-    llvm::WithColor::error()
-        << "No -target-linux-source specified. This argument is required.\n";
-    return 1;
-  }
-
-  // The LKM file is taken as a positional argument from the SourcePathList,
-  // after the normal CommonOptionsParser arguments. We expect exactly one:
-  auto PositionalArgs = CurrentKernelOptions.getSourcePathList();
-  if (PositionalArgs.empty()) {
-    llvm::WithColor::error()
-        << "No LKM source file specified as a positional argument.\n";
-    return 1;
-  }
-  // We'll just take the first one as "LKMFileToAnalyze"
-  std::string LKMFileToAnalyze = PositionalArgs.front();
-
-  // Read symbols from input_symbols.txt if provided
-  std::vector<std::string> SymbolsToCheck;
+  // read symbols from file if provided
+  std::vector<std::string> Symbols;
   if (!SymbolsFile.empty()) {
     std::ifstream ifs(SymbolsFile);
-    std::string sym;
-    while (std::getline(ifs, sym)) {
-      if (!sym.empty()) {
-        SymbolsToCheck.push_back(sym);
+    std::string line;
+    while (std::getline(ifs, line)) {
+      if (!line.empty()) {
+        Symbols.push_back(line);
       }
     }
   }
 
-  // 1) Gather function prototypes from the "current" environment
-  std::vector<FunctionInfo> OldFunctions;
+  // 1) first pass: gather function decls with the real DB
+  std::vector<FunctionInfo> OldFuncs;
   {
-    auto &DB = CurrentKernelOptions.getCompilations();
-    std::vector<std::string> AllFiles = DB.getAllFiles();
-    if (AllFiles.empty()) {
-      llvm::WithColor::warning()
-          << "No files found in the current compile_commands.json.\n";
+    auto &DB = Options.getCompilations();
+    auto SourceFiles = Options.getSourcePathList();
+    if (SourceFiles.empty()) {
+      llvm::WithColor::warning() << "No source files provided.\n";
     }
-    if (RunToolWithDB(DB, AllFiles, SymbolsToCheck, OldFunctions)) {
+    if (runFunctionAction(DB, SourceFiles, Symbols, OldFuncs)) {
+      llvm::WithColor::error() << "Error in first pass on provided files.\n";
+      return 1;
+    }
+  }
+
+  // 2) second pass: build a memory-based DB with replaced "directory"
+  //    and replaced flags. We run on the SAME source files again.
+  std::vector<FunctionInfo> NewFuncs;
+  {
+    auto SourceFiles = Options.getSourcePathList();
+    if (SourceFiles.empty()) {
+      llvm::WithColor::warning() << "No source files.\n";
+    }
+
+    // pick some new directory (the user wants -target-linux-source)
+    // If not provided, fallback to the old directory or something
+    if (TargetLinuxSource.empty()) {
       llvm::WithColor::error()
-          << "Error processing current environment prototypes.\n";
-      return 1;
+          << "No -target-linux-source specified, skipping second pass.\n";
+      compareFunctions(OldFuncs, NewFuncs);
+      return 0;
     }
-  }
 
-  // 2) Collect includes from the LKMFileToAnalyze
-  std::set<std::string> UsedHeaders;
-  {
-    auto &DB = CurrentKernelOptions.getCompilations();
+    // We'll keep the same flags from the first file, for example:
+    // just pick the compile commands for the first file from the real DB
+    auto &DB = Options.getCompilations();
+    if (!SourceFiles.empty()) {
+      auto CCVec = DB.getCompileCommands(SourceFiles.front());
+      if (!CCVec.empty()) {
+        // We'll transform them slightly:
+        auto OldDir =
+            CCVec.front().Directory; // e.g. "/usr/src/linux-headers-5.15..."
+        auto OldArgs = CCVec.front().CommandLine;
 
-    // Ensure we can find a compile command for LKMFileToAnalyze
-    // (some DBs use absolute vs. relative paths)
-    std::string FullCPath;
-    {
-      auto FilesInDB = DB.getAllFiles();
-      for (auto &F : FilesInDB) {
-        if (F.find(LKMFileToAnalyze) != std::string::npos) {
-          FullCPath = F;
-          break;
+        auto NewDir = TargetLinuxSource.getValue(); // user-specified
+        auto NewArgs = transformFlags(OldArgs);     // strip out some flags
+
+        // Build a memory DB with the same set of files, new directory, new args
+        MemoryCompileDB MemDB(SourceFiles, NewDir, NewArgs);
+
+        // run second pass
+        if (runFunctionAction(MemDB, SourceFiles, Symbols, NewFuncs)) {
+          llvm::WithColor::error() << "Error in second pass.\n";
+          return 1;
         }
-      }
-      if (FullCPath.empty() && !FilesInDB.empty()) {
+      } else {
         llvm::WithColor::warning()
-            << "Cannot find " << LKMFileToAnalyze
-            << " in compile_commands.json. Using first file.\n";
-        FullCPath = FilesInDB.front();
+            << "No compile command found for " << SourceFiles.front() << "\n";
       }
-    }
-
-    if (!FullCPath.empty()) {
-      clang::tooling::ClangTool IncludesTool(DB, {FullCPath});
-      auto Factory =
-          std::make_unique<CollectIncludesActionFactory>(UsedHeaders);
-      int Ret = IncludesTool.run(Factory.get());
-      if (Ret != 0) {
-        llvm::WithColor::error()
-            << "Error collecting includes from " << FullCPath << "\n";
-      }
-    } else {
-      llvm::WithColor::warning() << "No file to analyze for includes!\n";
     }
   }
 
-  // 3) Map those used headers to the target kernel, parse them
-  std::vector<FunctionInfo> NewFunctions;
-  if (!UsedHeaders.empty()) {
-    // Example: old base might be /usr/src/linux-headers-5.15.0-127-generic
-    std::string OldBase = "/usr/src/linux-headers-5.15.0-127-generic";
-
-    // 3a) We get the original compile command for LKMFileToAnalyze
-    auto &DB = CurrentKernelOptions.getCompilations();
-    std::vector<std::string> OriginalCmd =
-        getCompileCommandFor(DB, LKMFileToAnalyze);
-    if (OriginalCmd.empty()) {
-      llvm::WithColor::warning()
-          << "Could not retrieve a compile command for " << LKMFileToAnalyze
-          << ". Using a minimal approach.\n";
-    }
-
-    // 3b) Transform that command, rewriting -I references from OldBase =>
-    // TargetLinuxSource
-    std::vector<std::string> EditedArgs;
-    if (!OriginalCmd.empty()) {
-      EditedArgs =
-          transformCompileCommand(OriginalCmd, OldBase, TargetLinuxSource);
-      // Optionally adjust macros if you want to emulate a new version:
-      // EditedArgs.push_back("-DLINUX_VERSION_CODE=0x060800");
-    } else {
-      // fallback minimal approach
-      EditedArgs = {
-          "clang",
-          "-x",
-          TargetLanguage,
-          "-std=gnu89",
-          "-I" + TargetLinuxSource + "/include",
-      };
-    }
-
-    // 3c) Build a new compile DB with those edited args
-    clang::tooling::FixedCompilationDatabase TargetCDB(TargetLinuxSource,
-                                                       EditedArgs);
-
-    // 3d) For each header in UsedHeaders, map old => new
-    std::vector<std::string> TargetHeaderFiles;
-    TargetHeaderFiles.reserve(UsedHeaders.size());
-    for (auto &H : UsedHeaders) {
-      TargetHeaderFiles.push_back(mapOldToNew(H, OldBase, TargetLinuxSource));
-    }
-
-    // 3e) Parse them, collecting function prototypes
-    if (RunToolWithDB(TargetCDB, TargetHeaderFiles, SymbolsToCheck,
-                      NewFunctions)) {
-      llvm::WithColor::error() << "Error processing target linux headers.\n";
-      return 1;
-    }
-  } else {
-    llvm::WithColor::warning() << "No headers discovered for "
-                               << LKMFileToAnalyze << " (empty set).\n";
-  }
-
-  // 4) Compare
-  CompareFunctions(OldFunctions, NewFunctions);
+  // 3) compare
+  compareFunctions(OldFuncs, NewFuncs);
   return 0;
 }
