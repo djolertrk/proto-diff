@@ -69,5 +69,5 @@ $ sudo make modules_prepare
 
 Run from LKM dir:
 ```
-$ ../build_proto_diff/bin/proto-diff -p=. -symbols-file=input_symbols.txt -target-linux-source=/path/to/linux-6.8/ /path/to/src/fs.c
+$ ../build_proto_diff/bin/proto-diff -p=. -symbols-file=input_symbols.txt -target-linux-source=/path/to/linux-6.8/ -verbose -force-all-symbols -skip-added -skip-removed /path/to/src/fs.c
 ```

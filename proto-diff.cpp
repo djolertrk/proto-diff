@@ -1,18 +1,17 @@
-// A minimal proto-diff tool, doing two passes on the SAME files:
-//  1) Read normal compile_commands.json (run #1).
-//  2) Create an in-memory compile DB with replaced "directory" and flags
-//     (run #2), on the SAME source files.
+// A minimal proto-diff tool that parses only the single file you pass,
+// rather than all compile_commands.json entries.
 //
-// No usage of "FixedCompilationDatabase" or "CompileCommand.File" is needed.
-// We define local "startsWith" checks using manual string operations.
+// 1) Run on that single file with the real DB. Gather function prototypes.
+// 2) Create a memory-based DB with replaced "directory"/flags, run again
+//    on the SAME single file.
+// 3) Compare.
 //
-// By Djordje Todorovic
+// Author: Djordje Todorovic
 
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendAction.h"
-#include "clang/Lex/PPCallbacks.h"
 #include "clang/Tooling/CommonOptionsParser.h"
 #include "clang/Tooling/CompilationDatabase.h"
 #include "clang/Tooling/Tooling.h"
@@ -37,26 +36,31 @@ llvm::cl::opt<std::string>
     SymbolsFile("symbols-file", llvm::cl::desc("Path to input_symbols.txt"),
                 llvm::cl::value_desc("filename"), llvm::cl::cat(ToolCategory));
 
-// You want to transform "directory" field to this:
-llvm::cl::opt<std::string>
-    TargetLinuxSource("target-linux-source",
-                      llvm::cl::desc("New directory path to replace the "
-                                     "original compile command's directory"),
-                      llvm::cl::value_desc("path"),
-                      llvm::cl::cat(ToolCategory));
+llvm::cl::opt<std::string> TargetLinuxSource(
+    "target-linux-source",
+    llvm::cl::desc(
+        "New directory path to replace original compile command's directory"),
+    llvm::cl::value_desc("path"), llvm::cl::cat(ToolCategory));
+llvm::cl::opt<bool>
+    ForceAllSymbols("force-all-symbols",
+                    llvm::cl::desc("Force all symbols not just the ones "
+                                   "specified in the input_symbols.txt"),
+                    llvm::cl::init(false), llvm::cl::cat(ToolCategory));
+llvm::cl::opt<bool> VeboseOutput("verbose", llvm::cl::desc("Verbose output"),
+                                 llvm::cl::init(false),
+                                 llvm::cl::cat(ToolCategory));
+llvm::cl::opt<bool> SkipAdded("skip-added",
+                              llvm::cl::desc("Skip newely added functions"),
+                              llvm::cl::init(false),
+                              llvm::cl::cat(ToolCategory));
+llvm::cl::opt<bool> SkipRemoved("skip-removed",
+                                llvm::cl::desc("Skip removed functions"),
+                                llvm::cl::init(false),
+                                llvm::cl::cat(ToolCategory));
 } // end anonymous namespace
 
 // ------------------------------------------------------------------------
-// 2) Utility: startsWith (C++17-friendly, no std::string::starts_with)
-// ------------------------------------------------------------------------
-static bool startsWith(const std::string &Str, const std::string &Prefix) {
-  if (Prefix.size() > Str.size())
-    return false;
-  return std::equal(Prefix.begin(), Prefix.end(), Str.begin());
-}
-
-// ------------------------------------------------------------------------
-// 3) Data structures for function prototypes
+// 2) Data structure for function prototypes
 // ------------------------------------------------------------------------
 
 struct FunctionInfo {
@@ -66,48 +70,49 @@ struct FunctionInfo {
 };
 
 // ------------------------------------------------------------------------
-// 4) AST visitor to gather function declarations
+// 3) AST visitor to gather function declarations
 // ------------------------------------------------------------------------
 
 class FunctionDeclVisitor
     : public clang::RecursiveASTVisitor<FunctionDeclVisitor> {
 public:
-  FunctionDeclVisitor(clang::ASTContext &Ctx,
-                      std::vector<FunctionInfo> &OutFunctions,
+  FunctionDeclVisitor(clang::ASTContext &Ctx, std::vector<FunctionInfo> &Out,
                       const std::vector<std::string> &Symbols)
-      : Ctx(Ctx), OutFunctions(OutFunctions), Symbols(Symbols) {}
+      : Ctx(Ctx), Out(Out), Symbols(Symbols) {}
 
   bool VisitFunctionDecl(clang::FunctionDecl *FD) {
-    if (!Symbols.empty()) {
+    if (FD->getLocation().isMacroID()) {
+      return true; // skip expansions from macros
+    }
+
+    if (!Symbols.empty() && !ForceAllSymbols) {
       // If we have a list of symbols, skip others
       std::string Name = FD->getNameAsString();
-      if (std::find(Symbols.begin(), Symbols.end(), Name) == Symbols.end()) {
-        return true; // skip
-      }
+      if (std::find(Symbols.begin(), Symbols.end(), Name) == Symbols.end())
+        return true;
     }
 
     FunctionInfo Info;
     Info.Name = FD->getNameAsString();
     Info.ReturnType = FD->getReturnType().getAsString();
-    for (auto *Param : FD->parameters()) {
+    for (auto *Param : FD->parameters())
       Info.Parameters.push_back(Param->getType().getAsString());
-    }
-    OutFunctions.push_back(Info);
+    Out.push_back(std::move(Info));
     return true;
   }
 
 private:
   clang::ASTContext &Ctx;
-  std::vector<FunctionInfo> &OutFunctions;
+  std::vector<FunctionInfo> &Out;
   const std::vector<std::string> &Symbols;
 };
 
 class FunctionDeclASTConsumer : public clang::ASTConsumer {
 public:
   FunctionDeclASTConsumer(std::vector<FunctionInfo> &Out,
-                          const std::vector<std::string> &Syms,
+                          const std::vector<std::string> &Symbols,
                           clang::ASTContext &Ctx)
-      : Visitor(Ctx, Out, Syms) {}
+      : Visitor(Ctx, Out, Symbols) {}
 
   void HandleTranslationUnit(clang::ASTContext &Context) override {
     Visitor.TraverseDecl(Context.getTranslationUnitDecl());
@@ -120,39 +125,38 @@ private:
 class FunctionDeclAction : public clang::ASTFrontendAction {
 public:
   FunctionDeclAction(std::vector<FunctionInfo> &Out,
-                     const std::vector<std::string> &Syms)
-      : OutFunctions(Out), Symbols(Syms) {}
+                     const std::vector<std::string> &Symbols)
+      : Out(Out), Symbols(Symbols) {}
 
   std::unique_ptr<clang::ASTConsumer>
   CreateASTConsumer(clang::CompilerInstance &CI,
                     clang::StringRef /*InFile*/) override {
-    return std::make_unique<FunctionDeclASTConsumer>(OutFunctions, Symbols,
+    return std::make_unique<FunctionDeclASTConsumer>(Out, Symbols,
                                                      CI.getASTContext());
   }
 
 private:
-  std::vector<FunctionInfo> &OutFunctions;
+  std::vector<FunctionInfo> &Out;
   const std::vector<std::string> &Symbols;
 };
 
-// A small factory
 class FunctionDeclActionFactory : public clang::tooling::FrontendActionFactory {
 public:
   FunctionDeclActionFactory(std::vector<FunctionInfo> &Out,
-                            const std::vector<std::string> &Syms)
-      : OutFunctions(Out), Symbols(Syms) {}
+                            const std::vector<std::string> &Symbols)
+      : Out(Out), Symbols(Symbols) {}
 
   std::unique_ptr<clang::FrontendAction> create() override {
-    return std::make_unique<FunctionDeclAction>(OutFunctions, Symbols);
+    return std::make_unique<FunctionDeclAction>(Out, Symbols);
   }
 
 private:
-  std::vector<FunctionInfo> &OutFunctions;
+  std::vector<FunctionInfo> &Out;
   const std::vector<std::string> &Symbols;
 };
 
 // ------------------------------------------------------------------------
-// 5) Compare function prototypes
+// 4) Compare function prototypes
 // ------------------------------------------------------------------------
 static void compareFunctions(const std::vector<FunctionInfo> &OldF,
                              const std::vector<FunctionInfo> &NewF) {
@@ -178,15 +182,16 @@ static void compareFunctions(const std::vector<FunctionInfo> &OldF,
         llvm::outs() << "\n";
       }
     } else {
-      llvm::WithColor(llvm::outs(), llvm::HighlightColor::String)
-          << "Function \"" << OF.Name << "\" removed.\n";
+      if (!SkipRemoved)
+        llvm::WithColor(llvm::outs(), llvm::HighlightColor::String)
+            << "Function \"" << OF.Name << "\" removed.\n";
     }
   }
   // check newly added
   for (auto &NF : NewF) {
     auto It = std::find_if(OldF.begin(), OldF.end(),
                            [&](auto &OF) { return OF.Name == NF.Name; });
-    if (It == OldF.end()) {
+    if (It == OldF.end() && !SkipAdded) {
       llvm::WithColor(llvm::outs(), llvm::HighlightColor::String)
           << "Function \"" << NF.Name << "\" added.\n";
     }
@@ -194,96 +199,80 @@ static void compareFunctions(const std::vector<FunctionInfo> &OldF,
 }
 
 // ------------------------------------------------------------------------
-// 6) Helper function to run the function-decl action
-// ------------------------------------------------------------------------
-static bool runFunctionAction(clang::tooling::CompilationDatabase &DB,
-                              const std::vector<std::string> &Files,
-                              const std::vector<std::string> &Symbols,
-                              std::vector<FunctionInfo> &Out) {
-  clang::tooling::ClangTool Tool(DB, Files);
-  auto Factory = std::make_unique<FunctionDeclActionFactory>(Out, Symbols);
-  // returns 0 on success
-  return (Tool.run(Factory.get()) != 0);
-}
-
-// ------------------------------------------------------------------------
-// 7) Build a memory-based compile DB with updated "directory" + updated flags
+// 5) Minimal memory-based DB that changes "directory" and reuses the same flags
 // ------------------------------------------------------------------------
 class MemoryCompileDB : public clang::tooling::CompilationDatabase {
 public:
-  // We store a single set of arguments for each file in "Files".
-  MemoryCompileDB(std::vector<std::string> Files, std::string Directory,
-                  std::vector<std::string> Args)
-      : Files(std::move(Files)), Directory(std::move(Directory)),
-        Args(std::move(Args)) {}
+  MemoryCompileDB(std::string SingleFile, std::string Directory,
+                  std::vector<std::string> CommandLine)
+      : File(std::move(SingleFile)), Directory(std::move(Directory)),
+        CommandLine(std::move(CommandLine)) {}
 
-  // returns all files
-  std::vector<std::string> getAllFiles() const override { return Files; }
+  std::vector<std::string> getAllFiles() const override { return {File}; }
 
-  // returns compile commands for a given "FilePath"
   std::vector<clang::tooling::CompileCommand>
   getCompileCommands(llvm::StringRef FilePath) const override {
-    // If FilePath is in "Files", produce one command with updated
-    // directory/args
-    std::vector<clang::tooling::CompileCommand> Commands;
-    auto It = std::find(Files.begin(), Files.end(), FilePath.str());
-    if (It != Files.end()) {
-      // produce one command
+    if (FilePath == File) {
       clang::tooling::CompileCommand CC;
       CC.Directory = Directory;
-      CC.CommandLine = Args;
-      CC.Filename =
-          FilePath.str(); // old "File" replaced by "Filename" in older Clang
-      // "Output" can remain empty
-      Commands.push_back(std::move(CC));
+      CC.CommandLine = CommandLine;
+      CC.Filename = File;
+      return {CC};
     }
-    return Commands;
+    return {};
   }
 
-  // for completeness, "getCompileCommands()" for all files
   std::vector<clang::tooling::CompileCommand>
   getAllCompileCommands() const override {
-    std::vector<clang::tooling::CompileCommand> Commands;
-    for (auto &F : Files) {
-      clang::tooling::CompileCommand CC;
-      CC.Directory = Directory;
-      CC.CommandLine = Args;
-      CC.Filename = F;
-      Commands.push_back(std::move(CC));
-    }
-    return Commands;
+    clang::tooling::CompileCommand CC;
+    CC.Directory = Directory;
+    CC.CommandLine = CommandLine;
+    CC.Filename = File;
+    return {CC};
   }
 
 private:
-  std::vector<std::string> Files;
+  std::string File;
   std::string Directory;
-  std::vector<std::string> Args;
+  std::vector<std::string> CommandLine;
 };
 
-// A helper to strip or rewrite flags
-static std::vector<std::string>
-transformFlags(const std::vector<std::string> &OldFlags) {
-  std::vector<std::string> NewFlags;
-  for (auto &Flag : OldFlags) {
-    // For example, remove flags that cause clang warnings
-    // e.g. -falign-jumps=1, -Wimplicit-fallthrough=5, etc.
-    // Check "startsWith(Flag, "...")"
-    if (startsWith(Flag, "-falign-jumps=1")) {
-      continue; // skip
-    }
-    if (startsWith(Flag, "-Wimplicit-fallthrough=5")) {
-      continue; // skip
-    }
-    // ... etc. Or rewrite -I/usr/src => -I/home/djtodor...
-    // For minimal example, we just keep everything
-    NewFlags.push_back(Flag);
-  }
-  return NewFlags;
+// ------------------------------------------------------------------------
+// 6) Helper to run the function action
+// ------------------------------------------------------------------------
+static bool runFunctionAction(clang::tooling::CompilationDatabase &DB,
+                              const std::string &File,
+                              const std::vector<std::string> &Symbols,
+                              std::vector<FunctionInfo> &Out) {
+  clang::tooling::ClangTool Tool(DB, {File});
+  auto Factory = std::make_unique<FunctionDeclActionFactory>(Out, Symbols);
+  return (Tool.run(Factory.get()) != 0); // 0 success
 }
 
 // ------------------------------------------------------------------------
-// 8) main()
+// 7) main
 // ------------------------------------------------------------------------
+
+void printFlagsForFile(const clang::tooling::CompilationDatabase &DB,
+                       llvm::StringRef LKMSourceFile) {
+  // Get the compile commands for just this one file
+  auto Commands = DB.getCompileCommands(LKMSourceFile);
+  if (Commands.empty()) {
+    llvm::errs() << "No compile command found for " << LKMSourceFile << "\n";
+    return;
+  }
+
+  // Typically there's at most one or a small set of commands for the same file
+  for (auto &Cmd : Commands) {
+    llvm::errs() << "=== File: " << Cmd.Filename << " ===\n";
+    llvm::errs() << "Directory: " << Cmd.Directory << "\n";
+    llvm::errs() << "Arguments:\n";
+    for (auto &Arg : Cmd.CommandLine) {
+      llvm::errs() << "  " << Arg << "\n";
+    }
+    llvm::errs() << "\n";
+  }
+}
 
 int main(int argc, const char **argv) {
   auto ExpectedParser =
@@ -294,7 +283,7 @@ int main(int argc, const char **argv) {
         << llvm::toString(ExpectedParser.takeError()) << "\n";
     return 1;
   }
-  clang::tooling::CommonOptionsParser &Options = *ExpectedParser;
+  clang::tooling::CommonOptionsParser &Parser = *ExpectedParser;
 
   // read symbols from file if provided
   std::vector<std::string> Symbols;
@@ -308,64 +297,68 @@ int main(int argc, const char **argv) {
     }
   }
 
-  // 1) first pass: gather function decls with the real DB
+  // We expect exactly ONE .c file from the user:
+  auto SourcePaths = Parser.getSourcePathList();
+  if (SourcePaths.size() != 1) {
+    llvm::WithColor::error() << "Please provide exactly one source file, e.g. "
+                                "./proto-diff -p=. foo.c\n";
+    return 1;
+  }
+  std::string LKMFile = SourcePaths.front();
+
+  // 1) First pass: real DB on that single file
   std::vector<FunctionInfo> OldFuncs;
   {
-    auto &DB = Options.getCompilations();
-    auto SourceFiles = Options.getSourcePathList();
-    if (SourceFiles.empty()) {
-      llvm::WithColor::warning() << "No source files provided.\n";
+    auto &RealDB = Parser.getCompilations();
+    if (VeboseOutput)
+      printFlagsForFile(RealDB, LKMFile);
+
+    // find the compile command for LKMFile
+    auto CCVec = RealDB.getCompileCommands(LKMFile);
+    if (CCVec.empty()) {
+      llvm::WithColor::error() << "No compile command found for " << LKMFile
+                               << " in compile_commands.json.\n";
+      return 1;
     }
-    if (runFunctionAction(DB, SourceFiles, Symbols, OldFuncs)) {
-      llvm::WithColor::error() << "Error in first pass on provided files.\n";
+
+    if (runFunctionAction(RealDB, LKMFile, Symbols, OldFuncs)) {
+      llvm::WithColor::error() << "Error in first pass for " << LKMFile << "\n";
       return 1;
     }
   }
 
-  // 2) second pass: build a memory-based DB with replaced "directory"
-  //    and replaced flags. We run on the SAME source files again.
+  // 2) Second pass: memory-based DB with replaced directory (and same flags).
   std::vector<FunctionInfo> NewFuncs;
   {
-    auto SourceFiles = Options.getSourcePathList();
-    if (SourceFiles.empty()) {
-      llvm::WithColor::warning() << "No source files.\n";
-    }
-
-    // pick some new directory (the user wants -target-linux-source)
-    // If not provided, fallback to the old directory or something
     if (TargetLinuxSource.empty()) {
-      llvm::WithColor::error()
-          << "No -target-linux-source specified, skipping second pass.\n";
+      llvm::WithColor::error() << "No -target-linux-source specified.\n";
       compareFunctions(OldFuncs, NewFuncs);
       return 0;
     }
 
-    // We'll keep the same flags from the first file, for example:
-    // just pick the compile commands for the first file from the real DB
-    auto &DB = Options.getCompilations();
-    if (!SourceFiles.empty()) {
-      auto CCVec = DB.getCompileCommands(SourceFiles.front());
-      if (!CCVec.empty()) {
-        // We'll transform them slightly:
-        auto OldDir =
-            CCVec.front().Directory; // e.g. "/usr/src/linux-headers-5.15..."
-        auto OldArgs = CCVec.front().CommandLine;
+    auto &RealDB = Parser.getCompilations();
+    auto CCVec = RealDB.getCompileCommands(LKMFile);
+    if (!CCVec.empty()) {
+      // We'll just pick the first command
+      auto &CC = CCVec.front();
 
-        auto NewDir = TargetLinuxSource.getValue(); // user-specified
-        auto NewArgs = transformFlags(OldArgs);     // strip out some flags
+      // same flags
+      auto NewCommandLine = CC.CommandLine;
 
-        // Build a memory DB with the same set of files, new directory, new args
-        MemoryCompileDB MemDB(SourceFiles, NewDir, NewArgs);
+      // create memory DB with the new directory
+      MemoryCompileDB MemDB(LKMFile, TargetLinuxSource.getValue(),
+                            NewCommandLine);
 
-        // run second pass
-        if (runFunctionAction(MemDB, SourceFiles, Symbols, NewFuncs)) {
-          llvm::WithColor::error() << "Error in second pass.\n";
-          return 1;
-        }
-      } else {
-        llvm::WithColor::warning()
-            << "No compile command found for " << SourceFiles.front() << "\n";
+      if (VeboseOutput)
+        printFlagsForFile(MemDB, LKMFile);
+
+      if (runFunctionAction(MemDB, LKMFile, Symbols, NewFuncs)) {
+        llvm::WithColor::error() << "Error in second pass.\n";
+        return 1;
       }
+    } else {
+      llvm::WithColor::warning()
+          << "No compile command again for " << LKMFile << "\n";
     }
   }
 
